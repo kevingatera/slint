@@ -149,13 +149,17 @@ pub fn create_window_adapter()
 
 /// Wrapper around i_slint_core::translations::translate for the generated code
 pub fn translate(
-    origin: SharedString,
-    context: SharedString,
-    domain: SharedString,
+    origin: impl Into<SharedString>,
+    context: impl Into<SharedString>,
+    domain: impl Into<SharedString>,
     args: Slice<SharedString>,
     n: i32,
-    plural: SharedString,
+    plural: impl Into<SharedString>,
 ) -> SharedString {
+    let origin = origin.into();
+    let context = context.into();
+    let domain = domain.into();
+    let plural = plural.into();
     i_slint_core::translations::translate(&origin, &context, &domain, args.as_slice(), n, &plural)
 }
 

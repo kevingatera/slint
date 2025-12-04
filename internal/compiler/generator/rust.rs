@@ -145,12 +145,41 @@ fn set_primitive_property_value(ty: &Type, value_expression: TokenStream) -> Tok
 }
 
 /// Generate the rust code for the given component.
+#[derive(Debug, Default)]
+pub struct GeneratedRustCode {
+    /// The primary Rust module that must always be emitted.
+    pub base: TokenStream,
+    /// Optional companion module containing public components, to be included separately.
+    pub components: Option<TokenStream>,
+}
+
 pub fn generate(
     doc: &Document,
     compiler_config: &CompilerConfiguration,
 ) -> std::io::Result<TokenStream> {
+    let generated = generate_impl(doc, compiler_config, false)?;
+    Ok(generated.base)
+}
+
+/// Generate Rust code and optionally split public components into a separate module file.
+/// When `split_components` is true, the caller is expected to write `generated.base`
+/// into the main output file and `generated.components` (if present) into a companion
+/// file that gets included via `SLINT_COMPONENTS_FILE`.
+pub fn generate_with_separate_components(
+    doc: &Document,
+    compiler_config: &CompilerConfiguration,
+) -> std::io::Result<GeneratedRustCode> {
+    generate_impl(doc, compiler_config, true)
+}
+
+fn generate_impl(
+    doc: &Document,
+    compiler_config: &CompilerConfiguration,
+    split_components: bool,
+) -> std::io::Result<GeneratedRustCode> {
     if std::env::var("SLINT_LIVE_PREVIEW").is_ok() {
-        return super::rust_live_preview::generate(doc, compiler_config);
+        let base = super::rust_live_preview::generate(doc, compiler_config)?;
+        return Ok(GeneratedRustCode { base, components: None });
     }
 
     let module_header = generate_module_header();
@@ -192,7 +221,7 @@ pub fn generate(
     let llr = crate::llr::lower_to_item_tree::lower_to_item_tree(doc, compiler_config);
 
     if llr.public_components.is_empty() {
-        return Ok(Default::default());
+        return Ok(GeneratedRustCode { base: Default::default(), components: None });
     }
 
     let sub_compos = llr
@@ -241,7 +270,23 @@ pub fn generate(
     #[cfg(feature = "bundle-translations")]
     let translations = llr.translations.as_ref().map(|t| generate_translations(t, &llr));
 
-    Ok(quote! {
+    let components_mod = format_ident!("__components");
+    let (components_fragment, components_body) = if split_components {
+        (
+            quote! {
+                mod #components_mod { include!(env!("SLINT_COMPONENTS_FILE")); }
+                pub use #components_mod::*;
+            },
+            Some(quote! {
+                use super::*;
+                #(#public_components)*
+            }),
+        )
+    } else {
+        (quote!(#(#public_components)*), None)
+    };
+
+    let base = quote! {
         mod #generated_mod {
             #module_header
             #(#library_imports)*
@@ -250,7 +295,7 @@ pub fn generate(
             #(#library_globals_getters)*
             #(#sub_compos)*
             #popup_menu
-            #(#public_components)*
+            #components_fragment
             #shared_globals
             #(#resource_symbols)*
             #translations
@@ -259,7 +304,9 @@ pub fn generate(
         pub use #generated_mod::{#(#compo_ids,)* #(#structs_and_enums_ids,)* #(#globals_ids,)* #(#named_exports,)* #(#global_exports,)*};
         #[allow(unused_imports)]
         pub use slint::{ComponentHandle as _, Global as _, ModelExt as _};
-    })
+    };
+
+    Ok(GeneratedRustCode { base, components: components_body })
 }
 
 pub(super) fn generate_module_header() -> TokenStream {
@@ -341,7 +388,7 @@ fn generate_public_component(
 
     quote!(
         #component
-        pub struct #public_component_id(sp::VRc<sp::ItemTreeVTable, #inner_component_id>);
+        pub struct #public_component_id(pub sp::VRc<sp::ItemTreeVTable, #inner_component_id>);
 
         impl #public_component_id {
             pub fn new() -> ::core::result::Result<Self, slint::PlatformError> {
@@ -410,11 +457,15 @@ fn generate_shared_globals(
     let global_names = llr
         .globals
         .iter()
-        .filter(|g| g.must_generate())
+        .filter(|g| g.is_builtin || g.must_generate())
         .map(|g| format_ident!("global_{}", ident(&g.name)))
         .collect::<Vec<_>>();
-    let global_types =
-        llr.globals.iter().filter(|g| g.must_generate()).map(global_inner_name).collect::<Vec<_>>();
+    let global_types = llr
+        .globals
+        .iter()
+        .filter(|g| g.is_builtin || g.must_generate())
+        .map(global_inner_name)
+        .collect::<Vec<_>>();
 
     let from_library_global_names = llr
         .globals
@@ -465,7 +516,7 @@ fn generate_shared_globals(
         .unzip();
 
     quote! {
-        #pub_token struct SharedGlobals {
+        pub(crate) struct SharedGlobals {
             #(#pub_token #global_names : ::core::pin::Pin<sp::Rc<#global_types>>,)*
             #(#pub_token #from_library_global_names : ::core::pin::Pin<sp::Rc<#from_library_global_types>>,)*
             window_adapter : sp::OnceCell<sp::WindowAdapterRc>,
@@ -474,7 +525,7 @@ fn generate_shared_globals(
             #library_shared_globals_names : sp::Rc<#library_shared_globals_types>,)*
         }
         impl SharedGlobals {
-            #pub_token fn new(root_item_tree_weak : sp::VWeak<sp::ItemTreeVTable>) -> sp::Rc<Self> {
+            pub(crate) fn new(root_item_tree_weak : sp::VWeak<sp::ItemTreeVTable>) -> sp::Rc<Self> {
                 #(let #library_shared_globals_names = #library_shared_globals_types::new(root_item_tree_weak.clone());)*
                 let _self = sp::Rc::new(Self {
                     #(#global_names : #global_types::new(),)*
@@ -1242,7 +1293,7 @@ fn generate_sub_component(
             #(#timer_names : sp::Timer,)*
             self_weak : sp::OnceCell<sp::VWeakMapped<sp::ItemTreeVTable, #inner_component_id>>,
             #(parent : #parent_component_type,)*
-            globals: sp::OnceCell<sp::Rc<SharedGlobals>>,
+            pub(crate) globals: sp::OnceCell<sp::Rc<SharedGlobals>>,
             tree_index: ::core::cell::Cell<u32>,
             tree_index_of_first_child: ::core::cell::Cell<u32>,
         }
@@ -1445,7 +1496,7 @@ fn generate_global(
     }
 
     let mut init = vec![];
-    let inner_component_id = global_inner_name(global);
+    let inner_component_id = format_ident!("Inner{}", ident(&global.name));
 
     #[cfg(slint_debug_property)]
     init.push(quote!(
@@ -1507,7 +1558,7 @@ fn generate_global(
         }
     }));
 
-    let pub_token = if compiler_config.library_name.is_some() && !global.is_builtin {
+    let pub_token = if compiler_config.library_name.is_some() {
         global_exports.push(quote! (#inner_component_id));
         quote!(pub)
     } else {
@@ -1536,37 +1587,35 @@ fn generate_global(
         )
     });
 
-    let private_interface = (!global.is_builtin).then(|| {
-        quote!(
-            #[derive(sp::FieldOffsets, Default)]
-            #[const_field_offset(sp::const_field_offset)]
-            #[repr(C)]
-            #[pin]
-            #pub_token struct #inner_component_id {
-                #(#pub_token  #declared_property_vars: sp::Property<#declared_property_types>,)*
-                #(#pub_token  #declared_callbacks: sp::Callback<(#(#declared_callbacks_types,)*), #declared_callbacks_ret>,)*
-                #(#pub_token  #change_tracker_names : sp::ChangeTracker,)*
-                globals : sp::OnceCell<sp::Weak<SharedGlobals>>,
+    quote!(
+        #[derive(sp::FieldOffsets, Default)]
+        #[const_field_offset(sp::const_field_offset)]
+        #[repr(C)]
+        #[pin]
+        #pub_token struct #inner_component_id {
+            #(#pub_token  #declared_property_vars: sp::Property<#declared_property_types>,)*
+            #(#pub_token  #declared_callbacks: sp::Callback<(#(#declared_callbacks_types,)*), #declared_callbacks_ret>,)*
+            #(#pub_token  #change_tracker_names : sp::ChangeTracker,)*
+            pub(crate) globals : sp::OnceCell<sp::Weak<SharedGlobals>>,
+        }
+
+        impl #inner_component_id {
+            fn new() -> ::core::pin::Pin<sp::Rc<Self>> {
+                sp::Rc::pin(Self::default())
+            }
+            fn init(self: ::core::pin::Pin<sp::Rc<Self>>, globals: &sp::Rc<SharedGlobals>) {
+                #![allow(unused)]
+                let _ = self.globals.set(sp::Rc::downgrade(globals));
+                let self_rc = self;
+                let _self = self_rc.as_ref();
+                #(#init)*
             }
 
-            impl #inner_component_id {
-                fn new() -> ::core::pin::Pin<sp::Rc<Self>> {
-                    sp::Rc::pin(Self::default())
-                }
-                fn init(self: ::core::pin::Pin<sp::Rc<Self>>, globals: &sp::Rc<SharedGlobals>) {
-                    #![allow(unused)]
-                    let _ = self.globals.set(sp::Rc::downgrade(globals));
-                    let self_rc = self;
-                    let _self = self_rc.as_ref();
-                    #(#init)*
-                }
+            #(#declared_functions)*
+        }
 
-                #(#declared_functions)*
-            }
-        )
-    });
-
-    quote!(#private_interface #public_interface)
+        #public_interface
+    )
 }
 
 fn generate_global_getters(
@@ -2126,16 +2175,10 @@ fn access_member(reference: &llr::MemberReference, ctx: &EvaluationContext) -> M
             }
         }
         llr::MemberReference::Global { global_index, member } => {
+            let global_access = &ctx.generator_state.global_access;
             let global = &ctx.compilation_unit.globals[*global_index];
-            let s = if matches!(ctx.current_scope, EvaluationScope::Global(i) if i == *global_index)
-            {
-                quote!(_self)
-            } else {
-                let global_access = &ctx.generator_state.global_access;
-                let global_id = format_ident!("global_{}", ident(&global.name));
-                quote!(#global_access.#global_id.as_ref())
-            };
-            in_global(global, member, s)
+            let global_id = format_ident!("global_{}", ident(&global.name));
+            in_global(global, member, quote!(#global_access.#global_id.as_ref()))
         }
     }
 }
@@ -3351,7 +3394,17 @@ fn compile_builtin_function_call(
             quote!(sp::WindowInner::from_pub(#window_adapter_tokens.window()).set_text_input_focused(#(#a)*))
         }
         BuiltinFunction::Translate => {
-            quote!(slint::private_unstable_api::translate(#((#a) as _),*))
+            let translate_args = arguments.iter().map(|arg| match arg {
+                Expression::StringLiteral(s) => {
+                    let s = s.as_str();
+                    quote!(#s)
+                }
+                _ => {
+                    let t = compile_expression(arg, ctx);
+                    quote!((#t) as _)
+                }
+            });
+            quote!(slint::private_unstable_api::translate(#(#translate_args),*))
         }
         BuiltinFunction::Use24HourFormat => {
             quote!(slint::private_unstable_api::use_24_hour_format())
@@ -3386,14 +3439,6 @@ fn compile_builtin_function_call(
         BuiltinFunction::OpenUrl => {
             let url = a.next().unwrap();
             quote!(sp::open_url(&#url))
-        }
-        BuiltinFunction::EscapeMarkdown => {
-            let text = a.next().unwrap();
-            quote!(sp::escape_markdown(&#text))
-        }
-        BuiltinFunction::ParseMarkdown => {
-            let text = a.next().unwrap();
-            quote!(sp::parse_markdown(&#text))
         }
     }
 }

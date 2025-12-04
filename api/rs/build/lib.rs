@@ -58,6 +58,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use i_slint_compiler::diagnostics::BuildDiagnostics;
+use i_slint_compiler::generator::rust::GeneratedRustCode;
 
 /// The structure for configuring aspects of the compilation of `.slint` markup files to Rust.
 #[derive(Clone)]
@@ -575,8 +576,18 @@ pub fn compile_with_output_path(
     let output_file =
         std::fs::File::create(&output_rust_file_path).map_err(CompileError::SaveError)?;
     let mut code_formatter = CodeFormatter::new(BufWriter::new(output_file));
-    let generated = i_slint_compiler::generator::rust::generate(&doc, &loader.compiler_config)
-        .map_err(|e| CompileError::CompileError(vec![e.to_string()]))?;
+    let split_components = std::env::var_os("SLINT_SPLIT_COMPONENTS").is_some();
+    let generated = if split_components {
+        i_slint_compiler::generator::rust::generate_with_separate_components(
+            &doc,
+            &loader.compiler_config,
+        )
+        .map_err(|e| CompileError::CompileError(vec![e.to_string()]))?
+    } else {
+        let base = i_slint_compiler::generator::rust::generate(&doc, &loader.compiler_config)
+            .map_err(|e| CompileError::CompileError(vec![e.to_string()]))?;
+        GeneratedRustCode { base, components: None }
+    };
 
     let mut dependencies: Vec<std::path::PathBuf> = Vec::new();
 
@@ -593,7 +604,25 @@ pub fn compile_with_output_path(
         }
     });
 
-    write!(code_formatter, "{generated}").map_err(CompileError::SaveError)?;
+    if split_components {
+        if let Some(components) = &generated.components {
+            let components_path =
+                output_rust_file_path.as_ref().with_extension("components.rs");
+            let components_file =
+                std::fs::File::create(&components_path).map_err(CompileError::SaveError)?;
+            let mut components_formatter = CodeFormatter::new(BufWriter::new(components_file));
+            write!(components_formatter, "{components}").map_err(CompileError::SaveError)?;
+            components_formatter.sink.flush().map_err(CompileError::SaveError)?;
+            println!(
+                "cargo:rustc-env=SLINT_COMPONENTS_FILE={}",
+                components_path.display()
+            );
+        }
+        println!("cargo:rerun-if-env-changed=SLINT_COMPONENTS_FILE");
+        println!("cargo:rerun-if-env-changed=SLINT_SPLIT_COMPONENTS");
+    }
+
+    write!(code_formatter, "{}", generated.base).map_err(CompileError::SaveError)?;
     dependencies.push(input_slint_file_path.as_ref().to_path_buf());
 
     for resource in doc.embedded_file_resources.borrow().keys() {
