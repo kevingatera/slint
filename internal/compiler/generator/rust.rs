@@ -3425,6 +3425,14 @@ fn compile_builtin_function_call(
         BuiltinFunction::DetectOperatingSystem => {
             quote!(sp::detect_operating_system())
         }
+        BuiltinFunction::EscapeMarkdown => {
+            let text = a.next().unwrap();
+            quote!(sp::escape_markdown(&#text))
+        }
+        BuiltinFunction::ParseMarkdown => {
+            let text = a.next().unwrap();
+            quote!(sp::parse_markdown(&#text))
+        }
         // start and stop are unreachable because they are lowered to simple assignment of running
         BuiltinFunction::StartTimer => unreachable!(),
         BuiltinFunction::StopTimer => unreachable!(),
